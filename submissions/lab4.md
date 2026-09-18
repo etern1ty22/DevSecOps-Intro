@@ -1,6 +1,6 @@
 # Lab 4 — SBOM Generation and Software Composition Analysis
 
-Branch: `feature/lab4`. Executed on 2026-09-18. No PR created.
+Branch: `feature/lab4`. Executed on 2026-09-18.
 
 Image: `bkimminich/juice-shop:v20.0.0`, local Linux/amd64 variant.
 Repository/index digest from `docker inspect`:
