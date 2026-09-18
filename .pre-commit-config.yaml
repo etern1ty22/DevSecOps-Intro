@@ -8,3 +8,5 @@ repos:
     hooks:
       - id: detect-private-key
       - id: check-added-large-files
+        # Lab 4 requires committing these generated SBOM/attestation artifacts.
+        exclude: ^labs/lab4/juice-shop\.(cdx|spdx)\.json$|^labs/lab4/juice-shop-attestation\.json$
