@@ -76,8 +76,8 @@ The default (unprivileged) capability mask is identical under both runtimes —
 Kata does not change the Linux capability set a container sees, because that is
 decided by the OCI spec, not by where the kernel lives. The device counts are
 both small and similar; the interesting divergence is not here but in the
-*privileged* case (bonus), where runc exposes 181 host devices and Kata exposes
-none.
+*privileged* case (bonus), where runc exposes 181 host devices and Kata's
+privileged container will not start at all.
 
 ### What that one kernel line tells an attacker
 
@@ -202,29 +202,52 @@ container. Under Kata the agent tries to resolve those host device paths
 **inside the guest VM**, where they do not exist, so container creation aborts
 before any process runs. The host file stayed `original`.
 
+**The bind mount is not what breaks it.** Running the identical `--privileged`
+command with the `-v /tmp:/host_tmp` mount *removed* crashes with the same
+`get_host_path` error (`results/escape-extra.txt`, run B). So the failure is the
+device-passthrough half of `--privileged`, not the mount — Kata refuses the
+passthrough regardless of whether a host path is also requested.
+
 ### Device count and capability mask, privileged, both runtimes
 
-| | runc `--privileged` | Kata `--privileged` |
-| --- | --- | --- |
-| `ls /dev \| wc -l` | **181** | **0** (container failed to start) |
-| `CapEff` | `000001ffffffffff` | *(empty — no PID 1)* |
+A plain `--privileged` container never starts on Kata, so it yields no mask to
+read. To get a real maximum-privilege measurement under Kata I separated the two
+things `--privileged` bundles — the full capability set and host device
+passthrough — and granted only the first, with `--cap-add ALL`
+(`results/escape-extra.txt`):
 
-runc with `--privileged` jumps from 15 devices / `a80425fb` to **181 host
-devices** and the **full capability set** `000001ffffffffff`: the container is
-handed the host's `/dev` and every capability, which is why the bind-mount write
-lands on the host. Kata cannot even construct that container.
+| | runc `--privileged` | runc `--cap-add ALL` | Kata `--privileged` | Kata `--cap-add ALL` |
+| --- | --- | --- | --- | --- |
+| starts? | yes | yes | **no** (create aborts) | yes |
+| `ls /dev \| wc -l` | **181** | 15 | — | **14** |
+| `CapEff` | `000001ffffffffff` | `000001ffffffffff` | — | **`000001ffffffffff`** |
+| `uname -r` | host | host | — | `6.18.35` (guest) |
+
+Two things stand out. First, the **capability mask is the full
+`000001ffffffffff` wherever a container actually runs** — runc privileged, runc
+all-caps, and Kata all-caps are identical. The mask is therefore *not* what stops
+the escape. Second, what `--privileged` adds over `--cap-add ALL` is **device
+passthrough**: on runc that turns 15 devices into **181 host devices** — the
+host's real `/dev`, a direct escape surface on its own (host block devices,
+`/dev/mem`, and so on), independent of the bind mount; on Kata that same
+passthrough step is exactly what fails. Even holding the full capability set, a
+Kata container sees only **14 guest devices** and runs the **guest** kernel
+`6.18.35`, so there is no host `/dev` to own.
 
 ### Explanation
 
-`--privileged` grants a container the full Linux capability set *and direct
-access to the host's devices*. Under runc the "host" whose devices and kernel
-you now own **is the real machine** — so a privileged container with a host path
-mounted writes straight to the host filesystem, and the file changes. Under Kata,
-`--privileged` would grant privileges over the **guest** kernel and the guest's
-(empty) device tree, not the host's; here it did not even get that far, because
-the device-passthrough step had no host devices to resolve inside the VM and the
-runtime refused to start the container. The escape did not partly work on Kata —
-it did not run at all: the host file was still `original` afterward.
+`--privileged` grants two separate things: the full Linux capability set *and*
+direct passthrough of the host's devices. The `--cap-add ALL` runs above show
+these pull apart — capabilities are handed out identically on both runtimes, so
+the privilege that matters here is the **device passthrough**, and *to what* it
+grants access is the whole question. Under runc the devices and kernel you now
+own **are the real machine's** — so a privileged container with a host path
+mounted writes straight to the host filesystem, and the file changes. Under Kata
+the full capability set applies only to the **guest** kernel over a 14-node guest
+device tree, never the host's; the passthrough step cannot resolve host devices
+inside the VM, so the runtime refuses to start the container at all. The escape
+did not partly work on Kata — it did not run at all, and the host file was still
+`original` afterward.
 
 ### The honest limit
 
