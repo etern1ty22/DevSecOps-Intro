@@ -114,14 +114,15 @@ mean up to ~1.73 while the typical run is ~1.55. Reporting the median keeps that
 one slow run from lying about the common case.
 
 Note these numbers are *not* an order of magnitude apart, which the lab warned
-me to expect. The reason is honest and worth stating: the `nerdctl` + containerd
-machinery around the container costs ~1.37 s on *both* runtimes and dominates
-the wall clock. The actual VM-boot delta Kata adds is only the difference of the
-medians, ≈ **0.18 s**. The order-of-magnitude figure is the runtime-only cost of
-booting a guest kernel; here it is buried under the client/daemon overhead that
-both runtimes pay equally. (If the shim overhead were stripped out, the Dragonball
-micro-VM boot is the part that would show the ~10× gap against runc's near-zero
-process spawn.)
+me to expect. What I measured is the whole `nerdctl run` round trip, so the runc
+median of 1.37 s is the cost of everything both runtimes share (the `nerdctl`
+client, containerd, the rootfs snapshot, network setup) plus runc's own spawn. Kata
+adds **≈ 0.18 s** on top of that (difference of the medians), about 13%. I did
+not break the 1.37 s down further, so I cannot say how big the gap is for the
+runtime alone. Measuring that would need a run without the shared parts, for
+example `ctr run` with `--network none`, or the shim's own timing logs. What the
+numbers do show is that on this host, with Dragonball, a Kata start costs a
+fraction of a second more than a runc start.
 
 ### I/O throughput
 
@@ -189,24 +190,32 @@ Host file seeded with `original` before each run.
 
 | run | command | host `/tmp/lab12-target` after |
 | --- | --- | --- |
-| runc | `--privileged -v /tmp:/host_tmp ... echo OVERWRITTEN > /host_tmp/lab12-target` | **`OVERWRITTEN-BY-RUNC`** — escape succeeded |
-| Kata | identical + `--runtime=io.containerd.kata.v2` | **`original`** — unchanged; container never started |
+| runc | `--privileged -v /tmp:/host_tmp ... echo OVERWRITTEN-BY-RUNC > /host_tmp/lab12-target` | **`OVERWRITTEN-BY-RUNC`** — the write reached the host |
+| Kata | same flags + `--runtime=io.containerd.kata.v2` | **`original`** — unchanged, because the container never started |
+
+The payload string was changed per run (`OVERWRITTEN-BY-RUNC`,
+`OVERWRITTEN-BY-KATA-NONPRIV`) so the host file shows which run wrote it.
 
 On Kata the `create` call failed outright:
 
 > `failed to create shim task: ... get host path failed ... No such file or directory`
 > (`hypervisor::device::util::get_host_path`)
 
-`--privileged` asks the runtime to pass *all host devices* through to the
-container. Under Kata the agent tries to resolve those host device paths
-**inside the guest VM**, where they do not exist, so container creation aborts
-before any process runs. The host file stayed `original`.
+`--privileged` makes `nerdctl` list *every host device* in the OCI spec. The
+failure is on the host, not in the guest. The backtrace runs through
+`virt_container::...::Container::create` →
+`ResourceManagerInner::handler_devices` → `hypervisor::device::util::get_host_path`,
+all inside the runtime-rs shim (`containerd-shim-kata-v2`) on the host. While
+preparing the devices to attach to the VM, the shim could not resolve one of the
+listed devices to a host path and aborted `create`. The error is raised in the
+shim's device handling; nothing in the backtrace comes from the guest. No
+container process ever ran. I did not work out which device it was.
 
 **The bind mount is not what breaks it.** Running the identical `--privileged`
 command with the `-v /tmp:/host_tmp` mount *removed* crashes with the same
-`get_host_path` error (`results/escape-extra.txt`, run B). So the failure is the
-device-passthrough half of `--privileged`, not the mount — Kata refuses the
-passthrough regardless of whether a host path is also requested.
+`get_host_path` error (`results/escape-extra.txt`, run B). So the failure comes
+from the device-passthrough half of `--privileged`, not from the mount. This
+Kata build (4.1.0, runtime-rs + Dragonball) fails closed on that step.
 
 ### Device count and capability mask, privileged, both runtimes
 
@@ -229,25 +238,36 @@ all-caps, and Kata all-caps are identical. The mask is therefore *not* what stop
 the escape. Second, what `--privileged` adds over `--cap-add ALL` is **device
 passthrough**: on runc that turns 15 devices into **181 host devices** — the
 host's real `/dev`, a direct escape surface on its own (host block devices,
-`/dev/mem`, and so on), independent of the bind mount; on Kata that same
-passthrough step is exactly what fails. Even holding the full capability set, a
-Kata container sees only **14 guest devices** and runs the **guest** kernel
-`6.18.35`, so there is no host `/dev` to own.
+`/dev/mem`, and so on), independent of the bind mount. On Kata that same
+passthrough step is what fails. Even holding the full capability set, a Kata
+container sees only **14 guest devices** and runs the **guest** kernel
+`6.18.35`. Its `/dev` belongs to the VM, not to the host.
 
 ### Explanation
 
-`--privileged` grants two separate things: the full Linux capability set *and*
-direct passthrough of the host's devices. The `--cap-add ALL` runs above show
-these pull apart — capabilities are handed out identically on both runtimes, so
-the privilege that matters here is the **device passthrough**, and *to what* it
-grants access is the whole question. Under runc the devices and kernel you now
-own **are the real machine's** — so a privileged container with a host path
-mounted writes straight to the host filesystem, and the file changes. Under Kata
-the full capability set applies only to the **guest** kernel over a 14-node guest
-device tree, never the host's; the passthrough step cannot resolve host devices
-inside the VM, so the runtime refuses to start the container at all. The escape
-did not partly work on Kata — it did not run at all, and the host file was still
-`original` afterward.
+This vector bundles two different things, and they behave differently on Kata.
+
+1. **`--privileged`** grants the full capability set and passes the host's
+   devices through. Capabilities are granted over whichever kernel the container
+   runs on. On runc that is the host kernel, with 181 host devices next to it.
+   On Kata, `--cap-add ALL` gives the same full mask, but over the guest kernel
+   `6.18.35` and a 14-node guest `/dev`. This is the half the second kernel
+   contains: root with every capability inside a VM is root over the VM.
+2. **`-v /tmp:/host_tmp`** is a host directory handed to the container on
+   purpose. It does not depend on `--privileged` or on which kernel runs. The
+   non-privileged Kata run shows it: the mount is shared into the guest over
+   virtio-fs, and the write reached the host file
+   (`OVERWRITTEN-BY-KATA-NONPRIV`). I did not run a non-privileged runc control
+   with the same mount.
+
+So the host file stayed `original` after the Kata run because the container
+never started, not because the VM boundary blocked the write. The shim fails
+closed on the device-passthrough step. Had the container started, for example
+with the passthrough left out, the bind-mount write would have reached the host
+the same way it did in the non-privileged run. To answer the lab's question: in
+this run the escape did not work at all on Kata. Of its two parts, Kata
+contains the privilege-and-devices part and does not contain the bind-mount
+part.
 
 ### The honest limit
 
